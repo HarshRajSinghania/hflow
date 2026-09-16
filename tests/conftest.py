@@ -37,32 +37,45 @@ def _ffmpeg_version_tuple(version_line: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _require_ffmpeg_fps_mode() -> None:
-    """Fail once, with versions, if the suite ffmpeg is older than 5.1."""
+def _ffmpeg_below_fps_mode_floor() -> tuple[bool, str]:
+    """Return (too_old, reason) for the suite ffmpeg, if it can be parsed."""
     if _system_ffmpeg is None:
-        return
+        return False, ""
     completed = subprocess.run(
         [_system_ffmpeg, "-version"],
         check=False,
         capture_output=True,
         text=True,
     )
-    version_line = (completed.stdout or completed.stderr).splitlines()[0] if (
-        completed.stdout or completed.stderr
-    ) else ""
+    raw = completed.stdout or completed.stderr
+    version_line = raw.splitlines()[0] if raw else ""
     parsed = _ffmpeg_version_tuple(version_line)
-    if parsed is None:
+    if parsed is None or parsed >= _MIN_FFMPEG_VERSION:
+        return False, ""
+    required = ".".join(str(part) for part in _MIN_FFMPEG_VERSION)
+    found = ".".join(str(part) for part in parsed)
+    reason = (
+        f"ffmpeg {found} does not support -fps_mode "
+        f"(need {required} or newer; found {version_line!r}). "
+        "Upgrade ffmpeg or unset HFLOW_FFMPEG so the pinned build can be used."
+    )
+    return True, reason
+
+
+_FFMPEG_MEDIA_PATH_MARKERS = ("video", "episode", "encode", "ffmpeg", "mp4", "mux")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip ffmpeg-dependent tests on old binaries; leave the rest of the suite runnable."""
+    too_old, reason = _ffmpeg_below_fps_mode_floor()
+    if not too_old:
         return
-    if parsed < _MIN_FFMPEG_VERSION:
-        required = ".".join(str(part) for part in _MIN_FFMPEG_VERSION)
-        found = ".".join(str(part) for part in parsed)
-        pytest.exit(
-            f"ffmpeg {found} does not support -fps_mode "
-            f"(need {required} or newer; found {version_line!r}). "
-            "Upgrade ffmpeg or unset HFLOW_FFMPEG so the pinned build can be used.",
-            returncode=1,
-        )
+    skip = pytest.mark.skip(reason=reason)
+    for item in items:
+        path = str(getattr(item, "path", "") or item.fspath).lower()
+        nodeid = item.nodeid.lower()
+        if any(marker in path or marker in nodeid for marker in _FFMPEG_MEDIA_PATH_MARKERS):
+            item.add_marker(skip)
 
 
 @pytest.fixture
