@@ -62,19 +62,14 @@ def _ffmpeg_below_fps_mode_floor() -> tuple[bool, str]:
     return True, reason
 
 
-_FFMPEG_MEDIA_PATH_MARKERS = ("video", "episode", "encode", "ffmpeg", "mp4", "mux")
-
-
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip ffmpeg-dependent tests on old binaries; leave the rest of the suite runnable."""
+    """Skip tests marked as needing system ffmpeg when the binary is older than 5.1."""
     too_old, reason = _ffmpeg_below_fps_mode_floor()
     if not too_old:
         return
     skip = pytest.mark.skip(reason=reason)
     for item in items:
-        path = str(getattr(item, "path", "") or item.fspath).lower()
-        nodeid = item.nodeid.lower()
-        if any(marker in path or marker in nodeid for marker in _FFMPEG_MEDIA_PATH_MARKERS):
+        if item.get_closest_marker("requires_system_ffmpeg"):
             item.add_marker(skip)
 
 
