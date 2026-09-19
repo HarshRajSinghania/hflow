@@ -201,8 +201,16 @@ class VideoWindow:
 
 @dataclass(frozen=True)
 class PreparedVideoWindow:
+    """Encoded media and its logical interval in the original source.
+
+    ``properties`` describes the encoded file, whose duration may include frame
+    padding. ``source_window`` is the requested interval clipped to source EOF;
+    use its duration for source coverage and measurement weights.
+    """
+
     path: Path
     properties: VideoProperties
+    source_window: VideoWindow
 
 
 def prepare_video_window(
@@ -223,6 +231,14 @@ def prepare_video_window(
         or window.duration_seconds > limits.maximum_duration_seconds
     ):
         return UnsupportedVideo()
+    remaining_source_seconds = inspection.duration_seconds - Decimal(str(window.start_seconds))
+    if remaining_source_seconds <= 0:
+        return UnreadableVideo()
+    source_window = VideoWindow(
+        start_seconds=window.start_seconds,
+        duration_seconds=min(window.duration_seconds, float(remaining_source_seconds)),
+        frames_per_second=window.frames_per_second,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent, prefix=".video-window-") as directory:
         staged = Path(directory) / "window.mp4"
@@ -260,11 +276,11 @@ def prepare_video_window(
         if not isinstance(prepared_properties, VideoProperties):
             return prepared_properties
         if prepared_properties.duration_seconds < Decimal(
-            str(min(0.5, window.duration_seconds * 0.5))
+            str(min(0.5, source_window.duration_seconds * 0.5))
         ):
             return UnreadableVideo()
         os.link(staged, output)
-    return PreparedVideoWindow(output, prepared_properties)
+    return PreparedVideoWindow(output, prepared_properties, source_window)
 
 
 __all__ = [

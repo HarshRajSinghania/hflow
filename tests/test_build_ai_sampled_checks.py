@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 
 import httpx2
 import pytest
+from tenacity import AsyncRetrying
 
 import hflow
 from hflow.build_ai_vlm_checks import (
@@ -25,12 +28,13 @@ CAMERA_TOPIC = "/head_camera/compressed"
 
 class _StubHostedResponse:
     def __init__(self, payload: object) -> None:
+        self.headers: dict[str, str] = {}
         self._body = json.dumps(payload).encode("utf-8")
 
-    def __enter__(self) -> _StubHostedResponse:
+    async def __aenter__(self) -> _StubHostedResponse:
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         _exception_type: type[BaseException] | None,
         _exception: BaseException | None,
@@ -41,7 +45,7 @@ class _StubHostedResponse:
     def raise_for_status(self) -> None:
         return None
 
-    def iter_bytes(self) -> Iterator[bytes]:
+    async def aiter_raw(self) -> AsyncIterator[bytes]:
         yield self._body
 
 
@@ -63,7 +67,7 @@ def _scripted_hosted_answers(
             {"outcome": "parsed", "prediction": answer, "raw_response": str(answer)}
         )
 
-    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(hosted_response))
     return served
 
 
@@ -90,7 +94,7 @@ def test_sampled_hand_visibility_folds_no_hand_frames_into_intervals(
         application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
     )
 
-    report = application.test(_episode(tmp_path, duration_s=4.0), verbose=False)
+    report = asyncio.run(application.test(_episode(tmp_path, duration_s=4.0), verbose=False))
 
     run = report.check("build_ai_hand_visibility")
     assert run.status is hflow.CheckStatus.MEASURED, run.error
@@ -129,7 +133,7 @@ def test_sampled_run_reaching_the_end_closes_one_period_after_the_last_frame(
         application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
     )
 
-    report = application.test(_episode(tmp_path, duration_s=3.0), verbose=False)
+    report = asyncio.run(application.test(_episode(tmp_path, duration_s=3.0), verbose=False))
 
     run = report.check("build_ai_active_manipulation")
     assert run.result is not None, run.error
@@ -152,7 +156,7 @@ def test_an_unparsed_answer_ends_a_run_without_counting_as_absence(
         application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
     )
 
-    report = application.test(_episode(tmp_path, duration_s=4.0), verbose=False)
+    report = asyncio.run(application.test(_episode(tmp_path, duration_s=4.0), verbose=False))
 
     run = report.check("build_ai_hand_visibility")
     assert run.result is not None, run.error
@@ -172,7 +176,13 @@ def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
     import httpx2 as httpx_module
 
     sleeps: list[float] = []
-    monkeypatch.setattr("hflow.build_ai_vlm_checks.time.sleep", sleeps.append)
+
+    async def record_delay(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "hflow.build_ai_vlm_checks.AsyncRetrying", partial(AsyncRetrying, sleep=record_delay)
+    )
     answers: list[object] = [2, "http-504", 0, 2]
 
     class _FailingResponse(_StubHostedResponse):
@@ -195,13 +205,13 @@ def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
             {"outcome": "parsed", "prediction": answer, "raw_response": str(answer)}
         )
 
-    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(hosted_response))
     application = hflow.App("sampled-retry", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
         application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
     )
 
-    report = application.test(_episode(tmp_path, duration_s=3.0), verbose=False)
+    report = asyncio.run(application.test(_episode(tmp_path, duration_s=3.0), verbose=False))
 
     run = report.check("build_ai_hand_visibility")
     assert run.status is hflow.CheckStatus.MEASURED, run.error
@@ -222,7 +232,13 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
     import httpx2 as httpx_module
 
     sleeps: list[float] = []
-    monkeypatch.setattr("hflow.build_ai_vlm_checks.time.sleep", sleeps.append)
+
+    async def record_delay(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "hflow.build_ai_vlm_checks.AsyncRetrying", partial(AsyncRetrying, sleep=record_delay)
+    )
     attempts = 0
 
     class _AlwaysBusy(_StubHostedResponse):
@@ -236,7 +252,7 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
         attempts += 1
         return _AlwaysBusy({})
 
-    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(hosted_response))
     application = hflow.App("sampled-busy", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
         application,
@@ -244,7 +260,7 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
         sampling=FrameSampling(fps=1.0),
     )
 
-    report = application.test(_episode(tmp_path, duration_s=1.0), verbose=False)
+    report = asyncio.run(application.test(_episode(tmp_path, duration_s=1.0), verbose=False))
 
     run = report.check("build_ai_hand_visibility")
     assert run.status is hflow.CheckStatus.ERROR
@@ -278,7 +294,7 @@ def test_black_frames_are_skipped_and_never_read_as_absence(
         ),
     )
 
-    report = application.test(source, verbose=False)
+    report = asyncio.run(application.test(source, verbose=False))
 
     run = report.check("build_ai_hand_visibility")
     assert run.status is hflow.CheckStatus.MEASURED, run.error

@@ -14,6 +14,7 @@ infrastructure, not data: it is reported as an error, never recorded as a
 quality outcome.
 """
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -25,8 +26,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -36,11 +36,13 @@ from typing import TYPE_CHECKING, Generic, NewType, TypeVar, assert_never
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
 
+from hflow.asyncio_utils import run_blocking
 from hflow.catalog import (
     AppendResult,
     Catalog,
     CheckRunRow,
     QuarantineHistory,
+    _raise_if_measurement_keys_case_collide,
     content_episode_id,
 )
 from hflow.episode import Episode, _sanitize_topic
@@ -227,7 +229,9 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
-MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("1")
+# "2": sheet file names gained the collision-resistant topic digest (#535),
+# so the published artifact URIs this step records change.
+MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("2")
 # Published artifacts are recorded as measurements under this prefix, so a
 # reader can tell "here is where the file went" from an ordinary label.
 ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
@@ -482,6 +486,7 @@ _ConcurrentEpisodeLimit = NewType("_ConcurrentEpisodeLimit", int)
 _ConcurrentEpisodeLimit.__module__ = __name__
 _ConcurrentInputT = TypeVar("_ConcurrentInputT")
 _ConcurrentResultT = TypeVar("_ConcurrentResultT")
+_CheckFunctionT = TypeVar("_CheckFunctionT", bound=CheckFunction)
 
 
 def _parse_concurrent_episode_limit(max_workers: int) -> _ConcurrentEpisodeLimit:
@@ -492,80 +497,59 @@ def _parse_concurrent_episode_limit(max_workers: int) -> _ConcurrentEpisodeLimit
     return _ConcurrentEpisodeLimit(max_workers)
 
 
-def _run_with_bounded_concurrency(
+async def _run_with_bounded_concurrency(
     inputs: Sequence[_ConcurrentInputT],
-    operation: Callable[[_ConcurrentInputT], _ConcurrentResultT],
+    operation: Callable[[_ConcurrentInputT], Awaitable[_ConcurrentResultT]],
     *,
     concurrency_limit: _ConcurrentEpisodeLimit,
     on_completion: Callable[[int, _ConcurrentResultT, int, int], None] | None = None,
 ) -> list[_ConcurrentResultT]:
-    """Run at most ``concurrency_limit`` submitted operations, retaining input order.
-
-    A rolling window matters even though the executor also limits active threads:
-    ``Executor.map`` submits its complete input eagerly on Python 3.11-3.13. Keeping
-    submitted work bounded means a preparation failure can stop later episodes before
-    they create files or make endpoint calls. Already-running operations finish before
-    the exception escapes, so no worker keeps mutating a workspace after the caller has
-    regained control. Completion callbacks run on the coordinator before replacement
-    work is submitted, so a callback failure has the same stop-scheduling guarantee.
-    """
-
-    if not inputs:
-        return []
-
+    """Bound admission, preserve input order, and drain cancelled siblings on failure."""
     results_by_input_index: dict[int, _ConcurrentResultT] = {}
     next_input_index = 0
-    completed_result_count = 0
-    with ThreadPoolExecutor(max_workers=int(concurrency_limit)) as thread_pool:
-        input_index_by_future: dict[Future[_ConcurrentResultT], int] = {}
+    input_index_by_task: dict[asyncio.Task[_ConcurrentResultT], int] = {}
 
-        def submit_next_input() -> bool:
-            nonlocal next_input_index
-            if next_input_index >= len(inputs):
-                return False
-            submitted_input_index = next_input_index
+    async def execute_input(value: _ConcurrentInputT) -> _ConcurrentResultT:
+        return await operation(value)
+
+    def submit_next_input() -> None:
+        nonlocal next_input_index
+        if next_input_index < len(inputs):
+            input_index_by_task[asyncio.create_task(execute_input(inputs[next_input_index]))] = (
+                next_input_index
+            )
             next_input_index += 1
-            future = thread_pool.submit(operation, inputs[submitted_input_index])
-            input_index_by_future[future] = submitted_input_index
-            return True
 
-        for _ in range(min(int(concurrency_limit), len(inputs))):
-            submit_next_input()
-
-        try:
-            while input_index_by_future:
-                completed_futures, _ = wait(
-                    input_index_by_future,
-                    return_when=FIRST_COMPLETED,
-                )
-                ordered_completed_futures = sorted(
-                    completed_futures,
-                    key=input_index_by_future.__getitem__,
-                )
-                completed_results: list[tuple[int, _ConcurrentResultT]] = []
-                for completed_future in ordered_completed_futures:
-                    completed_input_index = input_index_by_future.pop(completed_future)
-                    completed_results.append((completed_input_index, completed_future.result()))
-                for completed_input_index, completed_result in completed_results:
-                    results_by_input_index[completed_input_index] = completed_result
-                    completed_result_count += 1
-                    if on_completion is not None:
-                        on_completion(
-                            completed_input_index,
-                            completed_result,
-                            completed_result_count,
-                            len(inputs),
-                        )
-                for _ in completed_results:
-                    submit_next_input()
-        except BaseException:
-            # Cancellation must also cover KeyboardInterrupt/SystemExit: returning control
-            # while queued workers can still write is unsafe regardless of failure kind.
-            for outstanding_future in input_index_by_future:
-                outstanding_future.cancel()
-            raise
-
-    return [results_by_input_index[input_index] for input_index in range(len(inputs))]
+    for _ in range(min(int(concurrency_limit), len(inputs))):
+        submit_next_input()
+    try:
+        while input_index_by_task:
+            completed_tasks, _ = await asyncio.wait(
+                input_index_by_task, return_when=asyncio.FIRST_COMPLETED
+            )
+            completed_results = [
+                (input_index_by_task[task], task.result())
+                for task in sorted(completed_tasks, key=input_index_by_task.__getitem__)
+            ]
+            for task in completed_tasks:
+                del input_index_by_task[task]
+            for input_index, result in completed_results:
+                results_by_input_index[input_index] = result
+                if on_completion is not None:
+                    on_completion(input_index, result, len(results_by_input_index), len(inputs))
+            for _ in completed_results:
+                submit_next_input()
+    finally:
+        for task in input_index_by_task:
+            task.cancel()
+        if input_index_by_task:
+            drain_task = asyncio.gather(*input_index_by_task, return_exceptions=True)
+            while not drain_task.done():
+                try:
+                    await asyncio.shield(drain_task)
+                except asyncio.CancelledError:
+                    continue
+    return [results_by_input_index[index] for index in range(len(inputs))]
 
 
 @dataclass(frozen=True)
@@ -849,6 +833,8 @@ def _raise_if_step_cannot_take_only_an_episode(
     # valid identifier, so the pasteable example needs a sanitized wrapper name.
     identifier_stem = re.sub(r"\W+", "_", step_name).strip("_")
     wrapper_name = f"{identifier_stem}_{wrapper_suffix}"
+    definition_prefix = "async " if step_kind is _RegistrationStepKind.CHECK else ""
+    await_prefix = "await " if step_kind is _RegistrationStepKind.CHECK else ""
     if unsatisfiable:
         # Bind every unsatisfiable parameter, not just the first: the example is
         # meant to be pasted, and a snippet binding one of two still fails.
@@ -859,15 +845,15 @@ def _raise_if_step_cannot_take_only_an_episode(
             f"required parameter(s) without defaults: {', '.join(sorted_names)}. "
             "Wrap it in a function that binds them, e.g.\n\n"
             f"    {decorator}\n"
-            f"    def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
-            f"        return {getattr(function, '__name__', step_name)}(ep, {bindings})\n"
+            f"    {definition_prefix}def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
+            f"        return {await_prefix}{getattr(function, '__name__', step_name)}(ep, {bindings})\n"
         )
     if not accepts_episode:
         raise ValueError(
             f"{step_kind.value} {step_name!r} cannot accept the episode: it must take "
             "the episode as its first positional parameter, e.g.\n\n"
             f"    {decorator}\n"
-            f"    def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
+            f"    {definition_prefix}def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
             "        ...\n"
         )
 
@@ -1031,6 +1017,7 @@ def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> Non
     deliberately unguarded: those tables carry ``check_name`` and have no
     per-key latest ranking, so two steps sharing one loses nothing.
     """
+    _raise_if_measurement_keys_case_collide(key for row in check_rows for key in row.measurements)
     steps_by_key: dict[str, list[str]] = {}
     for row in check_rows:
         for key in row.measurements:
@@ -1300,6 +1287,35 @@ class ProcessManyReport:
 TestReport = ProcessReport
 TestManyProgress = ProcessManyProgress
 TestManyReport = ProcessManyReport
+
+
+@dataclass(frozen=True)
+class _PendingCheck:
+    function: CheckFunction
+    episode: Episode
+
+
+@dataclass(frozen=True)
+class _CompletedProcessing:
+    report: ProcessReport
+
+
+def _advance_processing(
+    processing: Generator[_PendingCheck, CheckResult | None, ProcessReport],
+    outcome: CheckResult | Exception | None,
+) -> _PendingCheck | _CompletedProcessing:
+    # Keeping the blocking phases in one generator preserves the episode context
+    # across awaits without duplicating gates, publication, or catalog behavior.
+    try:
+        return (
+            processing.throw(outcome)
+            if isinstance(outcome, Exception)
+            else processing.send(outcome)
+        )
+    except StopIteration as completed:
+        if not isinstance(completed.value, ProcessReport):
+            raise TypeError("episode processing did not produce a report") from None
+        return _CompletedProcessing(completed.value)
 
 
 class App:
@@ -1733,8 +1749,12 @@ class App:
         critical: bool = False,
         requires: Iterable[str] | None = None,
         gate: Gate | None = None,
-    ) -> Callable[[CheckFunction], CheckFunction]:
-        """Register a check function. See ``hflow.steps.CheckResult``.
+    ) -> Callable[[_CheckFunctionT], _CheckFunctionT]:
+        """Register a check returning an awaitable ``hflow.steps.CheckResult``.
+
+        Use ``async def`` and await I/O. HFlow awaits checks on the caller's
+        event loop; blocking work must be explicitly offloaded with
+        ``hflow.asyncio_utils.run_blocking``.
 
         ``gate`` attaches a pass/fail policy the runner evaluates over the
         measurements this check returns, so a built-in that records evidence
@@ -1749,7 +1769,7 @@ class App:
         """
         step_version = parse_step_version(version)
 
-        def register(function: CheckFunction) -> CheckFunction:
+        def register(function: _CheckFunctionT) -> _CheckFunctionT:
             check_name = name if name is not None else getattr(function, "__name__", "")
             if not check_name:
                 raise ValueError("pass name=... when registering a callable without __name__")
@@ -1774,8 +1794,8 @@ class App:
                     "you build once and pass in, e.g.\n\n"
                     '    @app.check(version="1", critical=True, '
                     "gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)\n"
-                    f"    def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
-                    "        return hflow.checks.camera_frame_stats(ep)\n"
+                    f"    async def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
+                    "        return await hflow.checks.camera_frame_stats(ep)\n"
                 )
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.checks.append(
@@ -1965,7 +1985,7 @@ class App:
             key=lambda registered: bool(registered.requires),
         )
 
-    def test(
+    async def test(
         self,
         episode: Path | str,
         *,
@@ -1987,13 +2007,13 @@ class App:
         optionally limits execution to named registered steps within those
         stages.
         """
-        return self.process(
+        return await self.process(
             episode,
             output_dir=(
                 output_dir
                 if output_dir is not None
                 else self.workspace.test_runs_root.child(
-                    _source_artifact_directory_name(episode, self.storage_root)
+                    await run_blocking(_source_artifact_directory_name, episode, self.storage_root)
                 )
             ),
             verbose=verbose,
@@ -2002,7 +2022,7 @@ class App:
             step_names=step_names,
         )
 
-    def test_many(
+    async def test_many(
         self,
         episodes: Iterable[Path | str],
         *,
@@ -2021,7 +2041,7 @@ class App:
         semantics are those of :meth:`process_many`. Use that production-facing
         API for embedded workers and batch jobs.
         """
-        return self.process_many(
+        return await self.process_many(
             episodes,
             output_dir=self.workspace.test_runs_root,
             max_workers=max_workers,
@@ -2032,7 +2052,7 @@ class App:
             on_progress=on_progress,
         )
 
-    def process_many(
+    async def process_many(
         self,
         episodes: Iterable[Path | str],
         *,
@@ -2045,7 +2065,7 @@ class App:
         orchestrator_run_id: str | None = None,
         on_progress: Callable[[ProcessManyProgress], None] | None = None,
     ) -> ProcessManyReport:
-        """Process distinct episodes in-process, with bounded thread concurrency.
+        """Process distinct episodes in-process, with bounded async concurrency.
 
         Each episode uses :meth:`process`, including catalog recording by
         default. ``output_dir`` is a batch root: every source gets its own
@@ -2061,17 +2081,16 @@ class App:
 
         Reports preserve input order. At most ``max_workers`` episodes are
         submitted at once, sharing this application's registered functions and
-        their state; those functions must be thread-safe when concurrency is
-        greater than one. Do not change registrations during a batch.
-        ``on_progress`` runs on the calling coordinator thread after each
+        their state; check callbacks must offload blocking work explicitly. Do not change registrations during a batch.
+        ``on_progress`` runs on the caller's event loop after each
         completion, with the original input index. ``verbose=False`` avoids
-        interleaved summaries from worker threads.
+        interleaved summaries from concurrent episodes.
 
         Check and enrichment errors remain in each :class:`ProcessReport` and
         do not abort the batch; inspect ``has_errors`` as well as quality
         verdicts. Exceptions outside those per-step outcomes, such as source
         preparation, transform, or callback failures, stop new submissions,
-        wait for already-running episodes, and raise to the caller. Completed
+        cancel active checks, drain started blocking work, and raise to the caller. Completed
         files and catalog appends are not rolled back.
         This method provides no automatic retries, scheduling, or durable job
         state; the caller owns those policies and any partial results it keeps
@@ -2097,25 +2116,31 @@ class App:
             stages=stable_stages,
             step_names=stable_step_names,
         )
-        source_reference_by_identity: dict[str, Path | str] = {}
-        for episode_reference in episode_references:
-            source_identity = self.source_identity(episode_reference)
-            previous_reference = source_reference_by_identity.get(source_identity)
-            if previous_reference is not None:
-                raise ValueError(
-                    f"duplicate episode source identity {source_identity!r}: "
-                    f"{str(previous_reference)!r} and {str(episode_reference)!r}"
-                )
-            source_reference_by_identity[source_identity] = episode_reference
+
+        def validate_source_identities() -> None:
+            source_reference_by_identity: dict[str, Path | str] = {}
+            for episode_reference in episode_references:
+                source_identity = self.source_identity(episode_reference)
+                previous_reference = source_reference_by_identity.get(source_identity)
+                if previous_reference is not None:
+                    raise ValueError(
+                        f"duplicate episode source identity {source_identity!r}: "
+                        f"{str(previous_reference)!r} and {str(episode_reference)!r}"
+                    )
+                source_reference_by_identity[source_identity] = episode_reference
+
+        await run_blocking(validate_source_identities)
 
         batch_storage_root = parse_storage_root(output_dir) if output_dir is not None else None
 
-        def process_episode(episode_reference: Path | str) -> ProcessReport:
-            return self.process(
+        async def process_episode(episode_reference: Path | str) -> ProcessReport:
+            return await self.process(
                 episode_reference,
                 output_dir=(
                     batch_storage_root.child(
-                        _source_artifact_directory_name(episode_reference, self.storage_root)
+                        await run_blocking(
+                            _source_artifact_directory_name, episode_reference, self.storage_root
+                        )
                     )
                     if batch_storage_root is not None
                     else None
@@ -2145,7 +2170,7 @@ class App:
         if concurrency_limit == 1:
             sequential_reports: list[ProcessReport] = []
             for input_index, episode_reference in enumerate(episode_references):
-                report = process_episode(episode_reference)
+                report = await process_episode(episode_reference)
                 sequential_reports.append(report)
                 report_completion(
                     input_index,
@@ -2154,7 +2179,7 @@ class App:
                     len(episode_references),
                 )
             return ProcessManyReport(reports=tuple(sequential_reports))
-        reports = _run_with_bounded_concurrency(
+        reports = await _run_with_bounded_concurrency(
             episode_references,
             process_episode,
             concurrency_limit=concurrency_limit,
@@ -2238,7 +2263,7 @@ class App:
         print(started_summary(paths))
         return paths
 
-    def process(
+    async def process(
         self,
         episode: Path | str,
         *,
@@ -2249,6 +2274,7 @@ class App:
         step_names: Iterable[str] | None = None,
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
         _registered_step_selection: RegisteredStepSelection | None = None,
         _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
     ) -> ProcessReport:
@@ -2302,7 +2328,60 @@ class App:
         equivalent. The dev loop passes nothing and records NULL. Provenance
         only, never part of any identity hash (see
         :meth:`hflow.catalog.Catalog.append_episode`).
+
+        ``execution_id`` optionally identifies a catalog append across delayed
+        retries, independently of intervening runs. Persist it before the first
+        attempt and reuse it only for retries of that execution. Without it,
+        consecutive identical outcomes deduplicate and a recurring outcome
+        after another append becomes current again.
+
+        Check callbacks must return awaitable results. Transform, enrichment,
+        media, and catalog phases run off the event loop. Cancellation stops
+        checks and drains started blocking work before closing the episode;
+        completed files and catalog appends are not rolled back.
         """
+        processing = self._process_steps(
+            episode,
+            output_dir=output_dir,
+            verbose=verbose,
+            record=record,
+            stages=stages,
+            step_names=step_names,
+            quarantine_history=quarantine_history,
+            orchestrator_run_id=orchestrator_run_id,
+            execution_id=execution_id,
+            _registered_step_selection=_registered_step_selection,
+            _prepared_process_configuration=_prepared_process_configuration,
+        )
+        check_outcome: CheckResult | Exception | None = None
+        try:
+            while True:
+                step = await run_blocking(_advance_processing, processing, check_outcome)
+                if isinstance(step, _CompletedProcessing):
+                    return step.report
+                try:
+                    check_outcome = await step.function(step.episode)
+                except Exception as error:
+                    check_outcome = error
+        finally:
+            await run_blocking(processing.close)
+
+    def _process_steps(
+        self,
+        episode: Path | str,
+        *,
+        output_dir: Path | str | StorageRoot | None = None,
+        verbose: bool = False,
+        record: bool = True,
+        stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
+        quarantine_history: QuarantineHistory | None = None,
+        orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
+        _registered_step_selection: RegisteredStepSelection | None = None,
+        _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
+    ) -> Generator[_PendingCheck, CheckResult | None, ProcessReport]:
+        """Yield checks while retaining one blocking engine for all pipeline phases."""
         if _prepared_process_configuration is not None:
             if (
                 stages is not None
@@ -2348,7 +2427,10 @@ class App:
         run_dir.mkdir(parents=True, exist_ok=True)
         canonical_file_name = f"{source_path.stem}.canonical.mcap"
         canonical_path = run_dir / canonical_file_name
-        scratch_dir = run_dir / "scratch"
+        # Remux/frame scratch must follow canonical bytes, not the source-keyed
+        # run directory. A sync-omitted fetch can replace those bytes in place
+        # while leaving run_dir (and a flat scratch/) untouched (#536).
+        scratch_root = run_dir / "scratch"
         sync_completion_marker_path = run_dir / _SYNC_COMPLETION_MARKER_NAME
 
         stamps: EpisodeStamps | None = None
@@ -2406,10 +2488,10 @@ class App:
                     derived=derived_series or None,
                 )
             # The canonical file was just rewritten, so any mp4/frame artifacts
-            # a previous run cached in the scratch dir are stale -- including
-            # ones from a different source episode sharing this run dir's stem.
-            if scratch_dir.exists():
-                shutil.rmtree(scratch_dir)
+            # a previous run cached under scratch/ are stale -- including ones
+            # keyed on older content hashes for this same source run dir.
+            if scratch_root.exists():
+                shutil.rmtree(scratch_root)
             # So is any cached integrity verdict: it describes bytes that no
             # longer exist.
             self._canonical_integrity_cache.pop(str(canonical_path), None)
@@ -2437,6 +2519,13 @@ class App:
                     f"{sync_completion.source_path!r}, not {source_identifier!r}; "
                     "run the sync or full profile again"
                 )
+
+        # episode_id is the content hash of the canonical on disk now -- after
+        # sync rewrite, reuse, or sync-omitted fetch. Keying scratch here means
+        # Episode.video()'s output.exists() short-circuit can only hit a remux
+        # built from these exact bytes.
+        episode_id = content_episode_id(canonical_path)
+        scratch_dir = scratch_root / episode_id
 
         with Episode(canonical_path, workdir=scratch_dir) as canonical_episode:
             canonical_stamps = stamps_from_provenance(canonical_episode.metadata)
@@ -2603,7 +2692,7 @@ class App:
                 outcome: CheckOutcome
                 started = time.perf_counter()
                 try:
-                    returned = registered.function(canonical_episode)
+                    returned = yield _PendingCheck(registered.function, canonical_episode)
                     # Parse the boundary: user code may return anything.
                     if isinstance(returned, CheckResult):
                         outcome = Measured(returned)
@@ -2656,7 +2745,6 @@ class App:
             if Stage.META not in enabled_stages or isinstance(
                 registered_step_selection, SelectedRegisteredSteps
             ):
-                episode_id = content_episode_id(canonical_path)
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
                 else:
@@ -2779,6 +2867,7 @@ class App:
                 quarantine_tags=report.quarantine_tags,
                 source_uri=source_identifier,
                 orchestrator_run_id=orchestrator_run_id,
+                execution_id=execution_id,
                 time_bounds=episode_time_bounds,
             )
 

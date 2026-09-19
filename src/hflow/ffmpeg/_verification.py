@@ -36,12 +36,12 @@ class VerifiedMediaBinary:
 # Callers on other platforms supply the reviewed specification for that build.
 PINNED_LINUX_X86_64_FFMPEG = MediaBinarySpec(
     "ffmpeg",
-    "414037f32c343c3a1254a108e6ce6523770ce81e95ce64c67aa97ee3e612411f",
+    "ad7a8c8e8fe4f50972f32f63705cfcc57f44cd3531f57aa8defe388372242f5e",
     PINNED_VERSION_LABEL,
 )
 PINNED_LINUX_X86_64_FFPROBE = MediaBinarySpec(
     "ffprobe",
-    "91505681b7e1548c9754666e945cb4e53e7f0d66bc172838a18419f82992e62d",
+    "150bfd75016992a8d495a5f5c16cd93387a21c059f4309ed1e6342659aef48b3",
     PINNED_VERSION_LABEL,
 )
 

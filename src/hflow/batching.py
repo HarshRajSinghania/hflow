@@ -47,12 +47,15 @@ def plan_batches(
     *,
     batch_count: int | None = None,
     target_batch_bytes: int | None = None,
+    maximum_items_per_batch: int | None = None,
     stagger_interval_s: float = 0.0,
 ) -> list[PlannedBatch]:
     """Pack ``item_sizes`` (uri -> size in bytes) into near-equal-byte batches.
 
-    Pass exactly one of ``batch_count`` or ``target_batch_bytes``. Batches
-    come back largest-first; ``start_delay_s`` is ``index *
+    Pass exactly one of ``batch_count`` or ``target_batch_bytes``.
+    An optional item cap keeps each input whole. Fixed-count plans that cannot
+    fit every item under that cap fail; capacity plans open additional batches.
+    Batches come back largest-first; ``start_delay_s`` is ``index *
     stagger_interval_s``. Deterministic for a given input.
     """
     if (batch_count is None) == (target_batch_bytes is None):
@@ -66,6 +69,11 @@ def plan_batches(
         require_positive_int(batch_count, "batch_count")
     else:
         require_positive_int(target_batch_bytes, "target_batch_bytes")
+
+    if maximum_items_per_batch is not None:
+        require_positive_int(maximum_items_per_batch, "maximum_items_per_batch")
+        if batch_count is not None and len(item_sizes) > batch_count * maximum_items_per_batch:
+            raise ValueError("batch_count cannot fit all items within maximum_items_per_batch")
 
     if not item_sizes:
         return []
@@ -85,7 +93,8 @@ def plan_batches(
             total, index = heapq.heappop(heap)
             batches[index][0].append(uri)
             batches[index] = (batches[index][0], total + size_bytes)
-            heapq.heappush(heap, (total + size_bytes, index))
+            if maximum_items_per_batch is None or len(batches[index][0]) < maximum_items_per_batch:
+                heapq.heappush(heap, (total + size_bytes, index))
     else:
         assert target_batch_bytes is not None
         # First-fit-decreasing: first open batch with room, else a new one.
@@ -93,7 +102,10 @@ def plan_batches(
         batches = []
         for uri, size_bytes in descending_items:
             for index, (uris, total) in enumerate(batches):
-                if total + size_bytes <= target_batch_bytes:
+                has_item_capacity = (
+                    maximum_items_per_batch is None or len(uris) < maximum_items_per_batch
+                )
+                if has_item_capacity and total + size_bytes <= target_batch_bytes:
                     uris.append(uri)
                     batches[index] = (uris, total + size_bytes)
                     break
@@ -119,6 +131,7 @@ def plan_batches_from_files(
     *,
     batch_count: int | None = None,
     target_batch_bytes: int | None = None,
+    maximum_items_per_batch: int | None = None,
     stagger_interval_s: float = 0.0,
 ) -> list[PlannedBatch]:
     """:func:`plan_batches` over real files, sized with ``stat()``."""
@@ -127,5 +140,6 @@ def plan_batches_from_files(
         item_sizes,
         batch_count=batch_count,
         target_batch_bytes=target_batch_bytes,
+        maximum_items_per_batch=maximum_items_per_batch,
         stagger_interval_s=stagger_interval_s,
     )

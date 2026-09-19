@@ -80,4 +80,15 @@ across these changes.
 # source_uri as the data-root-prefixed and absolute spellings. The corrected
 # provenance changes canonical bytes for recordings previously processed under
 # the cwd-relative absolute identity, so they must not share a pipeline identity.
-TRANSFORM_BEHAVIOR_VERSION: str = "7"
+#
+# "8": the managed Linux FFmpeg pin now uses BtbN's retained August 2026
+# month-final build. Its version stamp changes canonical provenance whenever
+# video is transcoded, so those outputs must not share the old pipeline identity.
+#
+# "9": pass-through video channels now stamp the keyframe interval measured
+# off the copied bytes (``keyframe-interval/<topic>``). ``gop_seconds`` alone
+# reported what the encoder was told to do, which describes nothing on a path
+# that never encodes, so FORMAT.md's "keyframe interval actually used" was
+# false for pass-through episodes. The added provenance changes canonical
+# bytes for any episode carrying pre-encoded video (#376).
+TRANSFORM_BEHAVIOR_VERSION: str = "9"

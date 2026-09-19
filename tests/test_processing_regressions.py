@@ -1,5 +1,6 @@
 """Processing, publication, and user-step boundary regressions."""
 
+import asyncio
 import functools
 import json
 import logging
@@ -24,7 +25,7 @@ import hflow
 from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
 from hflow.doctor import diagnose
-from hflow.format import METADATA_RECORD_EPISODE
+from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
@@ -254,6 +255,86 @@ def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: P
     assert report.conforming, report.summary()
 
 
+def _provenance_of(episode: Path) -> dict[str, str]:
+    with episode.open("rb") as stream:
+        for record in make_reader(stream).iter_metadata():
+            if record.name == METADATA_RECORD_PROVENANCE:
+                return dict(record.metadata)
+    raise AssertionError(f"{episode} carries no {METADATA_RECORD_PROVENANCE} record")
+
+
+def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "irregular-gop-missing-auds.mcap"
+    original_payloads = _write_passthrough_video_source(
+        source,
+        [
+            ("/cam", 0, KEYFRAME_WITHOUT_AUD),
+            ("/cam", 100_000_000, NON_KEYFRAME_WITHOUT_AUD),
+            ("/cam", 200_000_000, KEYFRAME_WITHOUT_AUD),
+        ],
+    )["/cam"]
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    with output.open("rb") as stream:
+        output_payloads = [
+            message.data for _schema, _channel, message in make_reader(stream).iter_messages()
+        ]
+    original_messages = [CompressedVideo.FromString(payload) for payload in original_payloads]
+    output_messages = [CompressedVideo.FromString(payload) for payload in output_payloads]
+    for original, repaired in zip(original_messages, output_messages, strict=True):
+        assert bytes(repaired.data).endswith(bytes(original.data))
+        assert len(repaired.data) == len(original.data) + 6
+
+    # A keyframe every two frames IS a regular cadence. Before the transform
+    # measured it, the doctor compared this stream against the encoder's
+    # configured gop_seconds, which no pass-through copy ever applied, and
+    # reported the disagreement as the stream's fault (#376).
+    report = diagnose(output)
+    assert [
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    ] == []
+
+
+def test_doctor_still_reports_a_genuinely_irregular_passthrough_cadence(tmp_path: Path) -> None:
+    """Measuring the cadence must not turn the check into a rubber stamp.
+
+    Keyframes at message 0, 2, 4 and then 5: the median interval is still two
+    frames, so the stamp is 0.2 s, and the frame that breaks step is reported
+    against the stream's own cadence rather than against a configured value.
+    """
+    source = tmp_path / "irregular-gop.mcap"
+    _write_passthrough_video_source(
+        source,
+        [
+            (
+                "/cam",
+                index * 100_000_000,
+                KEYFRAME_ACCESS_UNIT if keyframe else NON_KEYFRAME_ACCESS_UNIT,
+            )
+            for index, keyframe in enumerate([True, False, True, False, True, True])
+        ],
+    )
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    provenance = _provenance_of(output)
+    assert provenance["keyframe-interval//cam"] == "0.2"
+    report = diagnose(output)
+    cadence_findings = [
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    ]
+    assert cadence_findings
+    assert any(
+        "message 5: is_keyframe=True, expected False" in finding.message
+        for finding in cadence_findings
+    )
+
+
 def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Path) -> None:
     source = tmp_path / "undelimited-mid-gop.mcap"
     _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
@@ -407,9 +488,9 @@ def test_sources_with_the_same_basename_get_distinct_artifact_paths(tmp_path: Pa
     )
     app = hflow.App("artifact-identity", data_root=tmp_path / "data", default_checks=())
 
-    first_report = app.process(first_source, record=False, stages={hflow.Stage.SYNC})
+    first_report = asyncio.run(app.process(first_source, record=False, stages={hflow.Stage.SYNC}))
     first_canonical_bytes = first_report.canonical_path.read_bytes()
-    second_report = app.process(second_source, record=False, stages={hflow.Stage.SYNC})
+    second_report = asyncio.run(app.process(second_source, record=False, stages={hflow.Stage.SYNC}))
 
     assert first_report.canonical_path != second_report.canonical_path
     assert first_report.canonical_path.read_bytes() == first_canonical_bytes
@@ -421,18 +502,18 @@ def test_failed_sync_clears_completion_proof_and_blocks_later_stages(tmp_path: P
         SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
     )
     app = hflow.App("sync-proof", data_root=tmp_path / "data", default_checks=())
-    successful_report = app.process(source, record=False, stages={hflow.Stage.SYNC})
+    successful_report = asyncio.run(app.process(source, record=False, stages={hflow.Stage.SYNC}))
     previous_canonical_bytes = successful_report.canonical_path.read_bytes()
 
     source.write_bytes(b"not an mcap file")
     with pytest.raises(InvalidMagic):
-        app.process(source, record=False, stages={hflow.Stage.SYNC})
+        asyncio.run(app.process(source, record=False, stages={hflow.Stage.SYNC}))
 
     # Atomic publication preserves the last valid artifact, but its missing
     # completion marker prevents a later stage from mistaking it for this run.
     assert successful_report.canonical_path.read_bytes() == previous_canonical_bytes
     with pytest.raises(FileNotFoundError, match="sync completion marker"):
-        app.process(source, record=False, stages={hflow.Stage.META})
+        asyncio.run(app.process(source, record=False, stages={hflow.Stage.META}))
 
 
 def test_check_returning_wrong_type_is_an_error_not_a_crash(
@@ -444,16 +525,16 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(
     app = hflow.App("boundary", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def returns_a_dict(ep: hflow.Episode) -> hflow.CheckResult:
+    async def returns_a_dict(ep: hflow.Episode) -> hflow.CheckResult:
         # Deliberate misuse: the cast smuggles a dict past the type checker,
         # which is exactly what un-typechecked user code would do.
         return cast(hflow.CheckResult, {"black_pct": 1.0})
 
     @app.check(version="1")
-    def well_behaved(ep: hflow.Episode) -> hflow.CheckResult:
+    async def well_behaved(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
-    report = app.test(source, verbose=False)
+    report = asyncio.run(app.test(source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["returns_a_dict"].status == hflow.CheckStatus.ERROR
     assert by_name["returns_a_dict"].error is not None
@@ -471,6 +552,7 @@ def test_direct_process_loop_logs_errors_without_logging_configuration(tmp_path:
     source = _state_only_episode(tmp_path)
     script = textwrap.dedent(
         """\
+        import asyncio
         import sys
         from pathlib import Path
         import hflow
@@ -479,14 +561,14 @@ def test_direct_process_loop_logs_errors_without_logging_configuration(tmp_path:
         app = hflow.App("error-loop", data_root=source.parent / "data", default_checks=())
 
         @app.check(version="1", critical=True)
-        def exploding(ep: hflow.Episode) -> hflow.CheckResult:
+        async def exploding(ep: hflow.Episode) -> hflow.CheckResult:
             raise RuntimeError("intentional probe failure")
 
         completed = 0
         for index in range(3):
             episode = source.with_name(f"episode_{index}.mcap")
             episode.write_bytes(source.read_bytes())
-            report = app.process(episode)
+            report = asyncio.run(app.process(episode))
             assert report.has_errors
             assert not report.quarantined
             completed += 1
@@ -513,6 +595,29 @@ def _state_only_episode(tmp_path: Path) -> Path:
     )
 
 
+@pytest.mark.parametrize("record", [False, True])
+@pytest.mark.parametrize("prefix", ["Camera", "ÉCamera"])
+def test_one_check_with_case_colliding_measurement_keys_is_refused(
+    tmp_path: Path, record: bool, prefix: str
+) -> None:
+    app = hflow.App("case-collision", data_root=tmp_path / "data", default_checks=())
+    first_key = f"/{prefix}/score"
+    second_key = first_key.replace("Camera", "camera")
+
+    @app.check(version="1")
+    async def scores(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={first_key: 0.1, second_key: 0.9})
+
+    with pytest.raises(ValueError, match=r"measurement keys.*collide") as failure:
+        asyncio.run(app.process(_state_only_episode(tmp_path), record=record))
+
+    message = str(failure.value)
+    assert repr(first_key) in message
+    assert repr(second_key) in message
+    assert "Rename" in message
+    assert list((tmp_path / "data" / "catalog").rglob("*.parquet")) == []
+
+
 def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) -> None:
     """Every step of one run shares its fingerprint and timestamp, so a shared
     key is a tie the catalog resolves arbitrarily -- one step's value silently
@@ -521,15 +626,15 @@ def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) ->
     app = hflow.App("key-collision", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def first(ep: hflow.Episode) -> hflow.CheckResult:
+    async def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"shared_count": 1})
 
     @app.check(version="1")
-    def second(ep: hflow.Episode) -> hflow.CheckResult:
+    async def second(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"shared_count": 2})
 
     with pytest.raises(ValueError, match="same measurement key") as failure:
-        app.test(_state_only_episode(tmp_path), verbose=False)
+        asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
     message = str(failure.value)
     assert "'shared_count'" in message
     assert "'first'" in message
@@ -544,7 +649,7 @@ def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) ->
     app = hflow.App("key-collision-enrich", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def measures(ep: hflow.Episode) -> hflow.CheckResult:
+    async def measures(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"overlap": 1})
 
     @app.enrich(version="1")
@@ -552,7 +657,7 @@ def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) ->
         return hflow.EnrichmentResult(labels={"overlap": 2})
 
     with pytest.raises(ValueError, match="same measurement key"):
-        app.test(_state_only_episode(tmp_path), verbose=False)
+        asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
 
 
 def test_a_refused_collision_records_nothing(tmp_path: Path) -> None:
@@ -565,15 +670,15 @@ def test_a_refused_collision_records_nothing(tmp_path: Path) -> None:
     app = hflow.App("key-collision-record", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def left(ep: hflow.Episode) -> hflow.CheckResult:
+    async def left(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"same": 1.0})
 
     @app.check(version="1")
-    def right(ep: hflow.Episode) -> hflow.CheckResult:
+    async def right(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"same": 2.0})
 
     with pytest.raises(ValueError, match="same measurement key"):
-        app.process(_state_only_episode(tmp_path), record=True)
+        asyncio.run(app.process(_state_only_episode(tmp_path), record=True))
 
     catalog_root = tmp_path / "data" / "catalog"
     assert list(catalog_root.rglob("*.parquet")) == []
@@ -586,14 +691,14 @@ def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
     app = hflow.App("shared-tag", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def first(ep: hflow.Episode) -> hflow.CheckResult:
+    async def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"first_count": 1}, tags=["reviewed"])
 
     @app.check(version="1")
-    def second(ep: hflow.Episode) -> hflow.CheckResult:
+    async def second(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"second_count": 2}, tags=["reviewed"])
 
-    report = app.test(_state_only_episode(tmp_path), verbose=False)
+    report = asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
     assert not report.has_errors
 
 
@@ -613,7 +718,7 @@ def test_check_with_optional_extra_parameter_registers() -> None:
     app = hflow.App("signature-optional", data_root=Path("/tmp"), default_checks=())
 
     @app.check(version="1")
-    def optional_topic(
+    async def optional_topic(
         ep: hflow.Episode, *, topics: tuple[str, ...] = ("/joint_states",)
     ) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(topics)})
@@ -649,7 +754,7 @@ def test_check_with_varargs_registers() -> None:
     app = hflow.App("signature-varargs", data_root=Path("/tmp"), default_checks=())
 
     @app.check(version="1")
-    def varargs_check(*args: object) -> hflow.CheckResult:
+    async def varargs_check(*args: object) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(args)})
 
     assert {check.name for check in app.checks} == {"varargs_check"}
@@ -667,13 +772,13 @@ def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> Non
     app = hflow.App("signature-defaulted-episode", data_root=Path("/tmp"), default_checks=())
 
     @app.check(version="1")
-    def defaulted_episode(episode: hflow.Episode | None = None) -> hflow.CheckResult:
+    async def defaulted_episode(episode: hflow.Episode | None = None) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"episode_arrived": episode is not None})
 
     assert {check.name for check in app.checks} == {"defaulted_episode"}
     # Registration is the regression, but assert it is callable the way the
     # runtime calls it, so the test fails if the call convention ever changes.
-    assert app.checks[0].function(cast(hflow.Episode, object())).measurements == {
+    assert asyncio.run(defaulted_episode(cast(hflow.Episode, object()))).measurements == {
         "episode_arrived": True
     }
 
@@ -742,7 +847,7 @@ def test_explicit_version_supports_opaque_callable_configuration() -> None:
     class OpaqueClient:
         pass
 
-    def scored_by_client(episode: hflow.Episode, *, client: object) -> hflow.CheckResult:
+    async def scored_by_client(episode: hflow.Episode, *, client: object) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ok": client is not None})
 
     app = hflow.App("opaque-registration", data_root=Path("/tmp"), default_checks=())
@@ -754,10 +859,10 @@ def test_explicit_version_supports_opaque_callable_configuration() -> None:
 
 
 def test_step_version_changes_only_when_the_author_bumps_it() -> None:
-    def before_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+    async def before_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": 0})
 
-    def after_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+    async def after_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
         running_total = 0
         return hflow.CheckResult(measurements={"n": running_total})
 
@@ -839,13 +944,15 @@ def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
     data_root.publish(episode_file, "landing/e.mcap")
 
     app = hflow.App("fetchless", data_root=data_root, default_checks=())
-    app.process("landing/e.mcap", record=True)
+    asyncio.run(app.process("landing/e.mcap", record=True))
 
     data_root.delete("landing/e.mcap")
     # A different worker: same bucket, fresh mirror (no cached source).
     fresh_root = BucketStorageRoot(f"file://{remote_dir}", mirror=tmp_path / "mirror-b")
     relabel_app = hflow.App("fetchless", data_root=fresh_root, default_checks=())
-    report = relabel_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    report = asyncio.run(
+        relabel_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    )
     assert report.stamps.pipeline_version
 
 
@@ -863,7 +970,7 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(
     def declares_a_ghost(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(artifacts={"ghost": tmp_path / "never-written.png"})
 
-    report = app.process(episode_file, record=True)
+    report = asyncio.run(app.process(episode_file, record=True))
     (enrichment_run,) = report.enrichments
     assert enrichment_run.status is hflow.CheckStatus.ERROR
     assert "never-written.png" in (enrichment_run.error or "")
@@ -905,16 +1012,18 @@ def test_source_identity_is_stable_across_vantage_points(
         app.source_identity(episode_file.resolve()),
     } == {"landing/e.mcap"}
 
-    full_report = app.process(episode_file.resolve(), record=True)
+    full_report = asyncio.run(app.process(episode_file.resolve(), record=True))
 
     relative_app = hflow.App("vantage", data_root=Path("data"), default_checks=())
-    prefixed_report = relative_app.process(
-        "data/landing/e.mcap", record=True, stages={hflow.Stage.LABELS}
+    prefixed_report = asyncio.run(
+        relative_app.process("data/landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
     )
     episode_file.unlink()
 
     assert relative_app.source_identity("landing/e.mcap") == "landing/e.mcap"
-    bare_report = relative_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    bare_report = asyncio.run(
+        relative_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    )
 
     assert prefixed_report.canonical_path.resolve() == full_report.canonical_path.resolve()
     assert bare_report.canonical_path.resolve() == full_report.canonical_path.resolve()
@@ -949,10 +1058,12 @@ def test_vanished_cwd_relative_source_keeps_its_persisted_identity(
     )
     monkeypatch.chdir(tmp_path)
     app = hflow.App("outside-root", data_root=tmp_path / "data", default_checks=())
-    full_report = app.process("external/e.mcap", record=True)
+    full_report = asyncio.run(app.process("external/e.mcap", record=True))
     expected_identity = str(source.resolve())
     source.unlink()
 
     assert app.source_identity("external/e.mcap") == expected_identity
-    relabel_report = app.process("external/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    relabel_report = asyncio.run(
+        app.process("external/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    )
     assert relabel_report.canonical_path.resolve() == full_report.canonical_path.resolve()

@@ -49,6 +49,43 @@ def test_more_batches_than_items_collapses() -> None:
     assert len(batches) == 1
 
 
+@pytest.mark.parametrize("sizes", [[0] * 7, [900, 500, 200, 100, 80, 10, 0]])
+def test_item_cap_keeps_complete_coverage_in_fixed_batches(sizes: list[int]) -> None:
+    item_sizes = {f"video-{index}": size for index, size in enumerate(sizes)}
+    batches = plan_batches(item_sizes, batch_count=3, maximum_items_per_batch=3)
+    assert len(batches) == 3
+    assigned = [item for batch in batches for item in batch.items]
+    assert sorted(assigned) == sorted(item_sizes)
+    assert all(len(batch.items) <= 3 for batch in batches)
+    assert sum(batch.total_bytes for batch in batches) == sum(sizes)
+    assert batches == plan_batches(
+        dict(reversed(list(item_sizes.items()))), batch_count=3, maximum_items_per_batch=3
+    )
+    with pytest.raises(ValueError, match="cannot fit all items"):
+        plan_batches(item_sizes, batch_count=2, maximum_items_per_batch=3)
+
+
+def test_item_cap_opens_capacity_batches_and_reaches_file_entrypoint(tmp_path: Path) -> None:
+    files = [tmp_path / f"video-{index}" for index in range(5)]
+    for video_file, size in zip(files, [120, 40, 30, 0, 0], strict=True):
+        video_file.write_bytes(b"x" * size)
+    batches = plan_batches_from_files(
+        files, target_batch_bytes=100, maximum_items_per_batch=2, stagger_interval_s=1
+    )
+    assert [batch.items for batch in batches] == [
+        (str(files[0]),),
+        (str(files[1]), str(files[2])),
+        (str(files[3]), str(files[4])),
+    ]
+    assert [batch.start_delay_s for batch in batches] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("cap", [True, 1.5, 0, -1])
+def test_invalid_item_cap_is_rejected_even_for_empty_input(cap: Any) -> None:
+    with pytest.raises(ValueError, match="maximum_items_per_batch"):
+        plan_batches({}, batch_count=1, maximum_items_per_batch=cap)
+
+
 def test_argument_validation() -> None:
     with pytest.raises(ValueError, match="exactly one"):
         plan_batches({"a": 1})

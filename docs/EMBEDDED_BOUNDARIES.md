@@ -28,6 +28,28 @@ failures; it is never included in public error messages.
 video stream, seeks with millisecond precision, resamples using FFmpeg's `fps`
 filter, and encodes H.264 with the `veryfast` preset. The caller owns its output.
 Existing output paths are refused and unsuccessful work leaves no partial output.
+The result's `source_window` retains the logical source start, duration, and
+sampling rate; its duration is clipped to the source's remaining duration at EOF.
+`properties` describes the encoded file, whose last frame can pad its duration.
+Use `source_window.duration_seconds` for source coverage and metric weights.
+An interval starting at or beyond EOF returns `UnreadableVideo` without an output.
+
+## Utility imports
+
+Import `hflow.statistics` or `hflow.batching` for summaries and planning. These
+modules use only the standard library. Public exports load lazily, so these
+imports and their package-level equivalents do not initialize pipeline, media,
+or model code. All modules ship in the single `hflow` distribution; its normal
+installation dependencies are unchanged.
+
+`plan_batches(..., maximum_items_per_batch=N)` optionally caps complete inputs
+per batch while retaining byte balancing. In fixed-count mode, an impossible
+combination of batch count and item cap raises before returning a plan. Capacity
+mode opens more batches as necessary, and an oversized input still stays whole
+in its own batch. `plan_batches_from_files` accepts the same option. Omitting
+the cap preserves existing behavior.
+
+## Episode preparation
 
 `hflow.importers.prepare_video_episode(source, output, config, limits=...)`
 returns `ImportedVideoEpisode` or a rejection outcome. It shares the importer
