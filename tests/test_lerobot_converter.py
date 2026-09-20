@@ -777,6 +777,7 @@ def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
     return units
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

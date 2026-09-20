@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.requires_system_ffmpeg
+
 from hflow import (
     KeyframeFallbackReason,
     SourceFrameSampling,
