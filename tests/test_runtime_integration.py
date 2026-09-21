@@ -328,4 +328,5 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         print(diagnostics_tail[-8000:])
         raise
     finally:
+        client.close()
         compose_down(paths.compose_file, project_name=COMPOSE_PROJECT_NAME, remove_volumes=True)

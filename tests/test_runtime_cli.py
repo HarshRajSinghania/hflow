@@ -1233,3 +1233,243 @@ def test_naming_a_missing_variable_is_still_refused(tmp_path: Path) -> None:
     pipeline_file.write_text("import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n")
     with pytest.raises(ValueError, match=r"no hflow\.App named 'garage'"):
         import_pipeline_application(f"{pipeline_file}:garage")
+
+
+def test_describe_remote_status_closes_client_on_success_and_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hflow.runtime._endpoint as endpoint_module
+    from hflow.runtime import BearerToken, RemoteRuntimeEndpoint, describe_remote_status
+
+    endpoint = RemoteRuntimeEndpoint("http://airflow.example", "test_dag", BearerToken("token"))
+    tracked_clients: list[AirflowClient] = []
+    original_client_for_endpoint = endpoint_module.client_for_endpoint
+
+    def tracking_client_for_endpoint(ep: RemoteRuntimeEndpoint) -> AirflowClient:
+        client = original_client_for_endpoint(ep)
+        tracked_clients.append(client)
+        return client
+
+    monkeypatch.setattr(endpoint_module, "client_for_endpoint", tracking_client_for_endpoint)
+
+    # 1. Success case:
+    monkeypatch.setattr(AirflowClient, "health", lambda self: HEALTHY)
+    monkeypatch.setattr(AirflowClient, "dag", lambda self, dag_id: {"dag_id": dag_id})
+    monkeypatch.setattr(AirflowClient, "dag_runs", lambda self, dag_id, **kw: [])
+    describe_remote_status(endpoint)
+    assert len(tracked_clients) == 1
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 2. Early return on unreachable health:
+    def unreachable_health(self: AirflowClient) -> AirflowHealth:
+        raise AirflowClientError("health down")
+
+    monkeypatch.setattr(AirflowClient, "health", unreachable_health)
+    describe_remote_status(endpoint)
+    assert len(tracked_clients) == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 3. Early return on unavailable dag:
+    def unavailable_dag(self: AirflowClient, dag_id: str) -> dict[str, object]:
+        raise AirflowClientError("dag not found")
+
+    monkeypatch.setattr(AirflowClient, "health", lambda self: HEALTHY)
+    monkeypatch.setattr(AirflowClient, "dag", unavailable_dag)
+    describe_remote_status(endpoint)
+    assert len(tracked_clients) == 3
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+
+def test_describe_runtime_status_closes_client_on_success_and_error(
+    monkeypatch: pytest.MonkeyPatch, pipeline_file: Path, tmp_path: Path
+) -> None:
+    import hflow.runtime._lifecycle as lifecycle_module
+    from hflow.runtime import BundlePaths, describe_runtime_status, load_bundle
+
+    bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
+    paths = load_bundle(bundle_dir)
+    tracked_clients: list[AirflowClient] = []
+    original_client_for_bundle = lifecycle_module.client_for_bundle
+
+    def tracking_client_for_bundle(bpaths: BundlePaths) -> AirflowClient:
+        client = original_client_for_bundle(bpaths)
+        tracked_clients.append(client)
+        return client
+
+    monkeypatch.setattr(lifecycle_module, "client_for_bundle", tracking_client_for_bundle)
+
+    # 1. Success case:
+    monkeypatch.setattr(AirflowClient, "health", lambda self: HEALTHY)
+    describe_runtime_status(paths)
+    assert len(tracked_clients) == 1
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 2. Error case:
+    def unreachable_health(self: AirflowClient) -> AirflowHealth:
+        raise AirflowClientError("unreachable")
+
+    monkeypatch.setattr(AirflowClient, "health", unreachable_health)
+    describe_runtime_status(paths)
+    assert len(tracked_clients) == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+
+def test_start_runtime_closes_client_on_success_and_failure(
+    compose_calls: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    import hflow.runtime._lifecycle as lifecycle_module
+    from hflow.runtime import BundlePaths, RuntimeConfig, start_runtime
+
+    config = RuntimeConfig(pipeline_file=pipeline_file, data_root=tmp_path / "data")
+    tracked_clients: list[AirflowClient] = []
+    original_client_for_bundle = lifecycle_module.client_for_bundle
+
+    def tracking_client_for_bundle(bpaths: BundlePaths) -> AirflowClient:
+        client = original_client_for_bundle(bpaths)
+        tracked_clients.append(client)
+        return client
+
+    monkeypatch.setattr(lifecycle_module, "client_for_bundle", tracking_client_for_bundle)
+    monkeypatch.setattr(AirflowClient, "wait_until_healthy", lambda self, **kw: HEALTHY)
+    monkeypatch.setattr(AirflowClient, "dag", lambda self, dag_id: {"dag_id": dag_id})
+
+    # 1. Success case:
+    start_runtime(config, tmp_path / "bundle1")
+    assert len(tracked_clients) == 1
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 2. Failure case (wait_until_healthy raises):
+    def failing_health_wait(self: AirflowClient, **kw: object) -> AirflowHealth:
+        raise AirflowClientError("health timeout")
+
+    monkeypatch.setattr(AirflowClient, "wait_until_healthy", failing_health_wait)
+    with pytest.raises(AirflowClientError):
+        start_runtime(config, tmp_path / "bundle2")
+    assert len(tracked_clients) == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 3. Failure case (_wait_until_dag_registered raises TimeoutError):
+    monkeypatch.setattr(AirflowClient, "wait_until_healthy", lambda self, **kw: HEALTHY)
+
+    def failing_dag_wait(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("DAG never registered")
+
+    monkeypatch.setattr(lifecycle_module, "_wait_until_dag_registered", failing_dag_wait)
+    with pytest.raises(TimeoutError):
+        start_runtime(config, tmp_path / "bundle3")
+    assert len(tracked_clients) == 3
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+
+def test_ingest_closes_client_on_success_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    from hflow.runtime import BundlePaths
+
+    bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
+    tracked_clients: list[AirflowClient] = []
+
+    def tracking_client_for_bundle(paths: BundlePaths) -> AirflowClient:
+        client = AirflowClient(paths.api_base_url, paths.admin_username, paths.admin_password)
+        tracked_clients.append(client)
+        return client
+
+    monkeypatch.setattr("hflow.runtime.client_for_bundle", tracking_client_for_bundle)
+
+    # 1. Success case:
+    monkeypatch.setattr(
+        AirflowClient,
+        "ingest",
+        lambda self, dag_id, uris, **kw: AirflowDagRun(
+            dag_run_id="run_1",
+            state="running",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        ),
+    )
+    exit_code = main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)])
+    assert exit_code == 0
+    assert len(tracked_clients) == 1
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 2. Error case (AirflowClientError):
+    def failing_ingest(
+        self: AirflowClient, dag_id: str, uris: list[str], **kw: object
+    ) -> AirflowDagRun:
+        raise AirflowClientError("ingest failed", status=500)
+
+    monkeypatch.setattr(AirflowClient, "ingest", failing_ingest)
+    exit_code = main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)])
+    assert exit_code == 1
+    assert len(tracked_clients) == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+
+def test_ingest_remote_closes_client_on_success_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.runtime import RemoteRuntimeEndpoint
+    from hflow.runtime._endpoint import AIRFLOW_TOKEN_ENVIRONMENT_VARIABLE
+
+    monkeypatch.setenv(AIRFLOW_TOKEN_ENVIRONMENT_VARIABLE, "token123")
+    tracked_clients: list[AirflowClient] = []
+
+    def tracking_client_for_endpoint(ep: RemoteRuntimeEndpoint) -> AirflowClient:
+        client = AirflowClient(ep.base_url, auth=ep.auth)
+        tracked_clients.append(client)
+        return client
+
+    monkeypatch.setattr("hflow.runtime.client_for_endpoint", tracking_client_for_endpoint)
+
+    # 1. Success case:
+    monkeypatch.setattr(
+        AirflowClient,
+        "ingest",
+        lambda self, dag_id, uris, **kw: AirflowDagRun(
+            dag_run_id="run_1",
+            state="running",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        ),
+    )
+    exit_code = main(
+        ["ingest", "a.mcap", "--airflow-url", "http://airflow.example", "--dag-id", "test_dag"]
+    )
+    assert exit_code == 0
+    assert len(tracked_clients) == 1
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
+
+    # 2. Error case:
+    def failing_ingest(
+        self: AirflowClient, dag_id: str, uris: list[str], **kw: object
+    ) -> AirflowDagRun:
+        raise AirflowClientError("ingest failed", status=500)
+
+    monkeypatch.setattr(AirflowClient, "ingest", failing_ingest)
+    exit_code = main(
+        ["ingest", "a.mcap", "--airflow-url", "http://airflow.example", "--dag-id", "test_dag"]
+    )
+    assert exit_code == 1
+    assert len(tracked_clients) == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        tracked_clients[-1].task_instances("d", "r")
