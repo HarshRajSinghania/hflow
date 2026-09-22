@@ -12,7 +12,6 @@ from numpy.typing import NDArray
 
 from hflow.blur import measure_video_blur, summarize_blur_scores
 
-pytestmark = pytest.mark.requires_system_ffmpeg
 
 
 def test_summary_preserves_raw_scores_and_excludes_unavailable_frames() -> None:
@@ -50,6 +49,7 @@ def write_static_video(video_path: Path, frame: NDArray[np.uint8]) -> None:
         writer.release()
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_video_adapter_distinguishes_defocus_from_missing_detail(tmp_path: Path) -> None:
     row_indices, column_indices = np.indices((128, 192))
     sharp_frame = (((row_indices // 16 + column_indices // 16) % 2) * 255).astype(np.uint8)

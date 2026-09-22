@@ -5,9 +5,6 @@ import time
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.requires_system_ffmpeg
-
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,
@@ -24,6 +21,8 @@ from hflow.video import (
     split_annex_b_stream,
     write_access_units_to_mp4,
 )
+
+pytestmark = pytest.mark.requires_system_ffmpeg
 
 FRAME_COUNT = 48
 FPS = 12.0

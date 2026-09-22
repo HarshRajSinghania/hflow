@@ -37,12 +37,21 @@ def _ffmpeg_version_tuple(version_line: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+def _suite_ffmpeg() -> str | None:
+    """ffmpeg the suite actually uses: HFLOW_FFMPEG if set, else PATH."""
+    override = os.environ.get("HFLOW_FFMPEG")
+    if override:
+        return override
+    return _system_ffmpeg
+
+
 def _ffmpeg_below_fps_mode_floor() -> tuple[bool, str]:
     """Return (too_old, reason) for the suite ffmpeg, if it can be parsed."""
-    if _system_ffmpeg is None:
+    ffmpeg = _suite_ffmpeg()
+    if ffmpeg is None:
         return False, ""
     completed = subprocess.run(
-        [_system_ffmpeg, "-version"],
+        [ffmpeg, "-version"],
         check=False,
         capture_output=True,
         text=True,
