@@ -24,6 +24,7 @@ import numpy as np
 from hflow._field_guards import (
     require_finite_float,
     require_int_in_range,
+    require_non_negative_float,
     require_positive_float,
 )
 from hflow._video_measurement_toolchain import (
@@ -1229,25 +1230,11 @@ def _measure_camera_stability(
     unstable_min_duration_s: float = 0.0,
 ) -> CheckResult:
 
-    if (
-        isinstance(shake_threshold_dps, bool)
-        or not np.isfinite(shake_threshold_dps)
-        or shake_threshold_dps < 0
-    ):
-        raise ValueError("shake_threshold_dps must be finite and non-negative")
+    require_non_negative_float(shake_threshold_dps, "shake_threshold_dps")
+    require_non_negative_float(unstable_min_duration_s, "unstable_min_duration_s")
 
-    if (
-        isinstance(unstable_min_duration_s, bool)
-        or not np.isfinite(unstable_min_duration_s)
-        or unstable_min_duration_s < 0
-    ):
-        raise ValueError("unstable_min_duration_s must be finite and non-negative")
-
-    if (
-        isinstance(horizontal_field_of_view_degrees, bool)
-        or not np.isfinite(horizontal_field_of_view_degrees)
-        or not 0 < horizontal_field_of_view_degrees <= 360
-    ):
+    require_finite_float(horizontal_field_of_view_degrees, "horizontal_field_of_view_degrees")
+    if not 0 < horizontal_field_of_view_degrees <= 360:
         raise ValueError(
             f"horizontal_field_of_view_degrees must be finite and in (0, 360], got {horizontal_field_of_view_degrees}"
         )
@@ -1997,15 +1984,8 @@ def _measure_camera_fps_conformance(
     downsample_tolerance_fps: float = 1,
 ) -> CheckResult:
 
-    if isinstance(max_plausible_fps, bool):
-        raise ValueError("max_plausible_fps must be a float, got bool")
-    if not np.isfinite(max_plausible_fps) or max_plausible_fps <= 0:
-        raise ValueError("max_plausible_fps must be finite and positive")
-
-    if isinstance(downsample_tolerance_fps, bool):
-        raise ValueError("downsample_tolerance_fps must be a float, got bool")
-    if not np.isfinite(downsample_tolerance_fps) or downsample_tolerance_fps < 0:
-        raise ValueError("downsample_tolerance_fps must be finite and non-negative")
+    require_positive_float(max_plausible_fps, "max_plausible_fps")
+    require_non_negative_float(downsample_tolerance_fps, "downsample_tolerance_fps")
 
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}

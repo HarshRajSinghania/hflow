@@ -30,13 +30,49 @@ The existing canonical `camera_video` enrichment keeps its constant-rate contrac
 `hflow.importers.video.prepare_model_video(source, output, config, limits=...,
 transform_config=...)` uses `VideoImportConfig` and `TransformConfig` to produce
 canonical model-input pixels without first writing an MCAP. It shares the video
-importer's fixed-rate JPEG rendering and canonical H.264 encoding, including the
-single-frame cadence. Output is an atomically published caller-owned MP4.
+importer's direct source-to-H.264 encoding: fixed-rate sampling, aspect-preserving
+resize and letterboxing, then libx264, with no JPEG intermediate. Output is an
+atomically published caller-owned MP4. Removing the former lossy JPEG step
+intentionally changes pixels compared with older imports.
+
+`import_video_episode` and `prepare_video_episode` also accept `transform_config`.
+Use the same `TransformConfig` for import, canonical SYNC, and direct preparation
+to obtain identical decoded pixels. Custom `crf`, `gop_preset`, and explicit
+`gop_seconds` are applied at import/direct preparation; explicit seconds override
+the preset. Canonical SYNC validates and copies the encoded access units without
+a second lossy encode. If requested CRF or effective GOP seconds differ from the
+import metadata (or those settings are missing), SYNC raises `SourceNotConforming`
+with instructions to re-import the original video with the requested settings.
+Changing only grouping/compression settings does not require re-import. Ordinary
+recorded H.264 without the first-party import record retains its existing
+pass-through behavior; legacy JPEG landing episodes still transcode at SYNC.
+
+For example, pass `TransformConfig(crf=18, gop_seconds=2.0)` as `transform_config`
+to either import function and to `prepare_model_video`, and as `config` to
+`write_canonical_episode`. Encoding choices live in `video_import/v1`, along with
+source identity, sampling settings, and the actual FFmpeg version. Landing remains
+a source episode: only caller metadata enters `episode/v1`; the canonical
+transform still owns grouping, QC boundaries, and `provenance/v1`.
+
+Samples retain the half-open excerpt grid and MCAP timestamps. When there is only
+one sample, its H.264 encoder timing and exported MP4 packet/container duration
+are one second, even for sampling rates below or above 1 Hz. Multi-frame output
+uses the requested sampling rate.
+
+`VideoImportConfig.maximum_encoded_bytes` defaults to 64 MiB (exclusive) for all
+three entrypoints. FFmpeg is asked to stop at that size (it may overshoot by one
+encoded packet); size is checked before Python reads/splits/validates the stream.
+Reaching the limit rejects the excerpt without publishing output. Split larger
+excerpts or explicitly raise the budget. Buffering is bounded by the selected
+encoded-byte budget but includes copied access units, parser objects and validation
+buffers: this is not a 64 MiB total-memory/RSS guarantee. Existing source/output
+dimension limits, timeouts, bounded diagnostics, and temporary-file cleanup remain.
 
 Expected media failures return `UnreadableVideo` or `UnsupportedVideo`; operational
-failures raise. Existing destinations raise `FileExistsError`. The JPEG intermediate
-is intentional: bypassing it would change model-input pixels. This helper does not
-change canonical transformation defaults or identities.
+failures raise. The exception-style `import_video_episode` raises `ValueError` for
+unsupported excerpts, including the encoded-byte limit. Existing destinations raise
+`FileExistsError`. New import identities reflect the new encoded bytes and importer
+metadata; canonical encoding defaults and generic H.264 pass-through are unchanged.
 
 ## Frame statistics
 
@@ -70,3 +106,30 @@ These measurements do not classify footage as blurry or unstable and are not
 accuracy estimates. See [streaming camera motion](how-to/stream-camera-motion.md)
 for extraction and filtering contracts, and [source sampling](how-to/sample-source-video.md)
 for original-frame evidence selection.
+
+## Shared window measurements
+
+`measure_video_window_independently` uses the same single decode and selection,
+but returns an `IndependentVideoWindowMeasurements` with a typed
+`MeasurementFailure` for a branch whose Python motion calculation or output
+parsing fails. `None` still means the branch was not selected. Source probe,
+FFmpeg graph, timeout, and filesystem failures are shared and cannot yield
+independent measurements. The original `measure_video_window` keeps its strict
+all-or-nothing behavior.
+
+`hflow.window_measurements.measure_video_window(source, window, selection,
+limits=VideoLimits(), toolchain=None)` measures one `VideoWindow` of the original
+source with a single decode. FFmpeg seeks the source, applies the window's `fps`
+filter and its default display-rotation handling, then splits the frames between
+the measurements chosen by `WindowMeasurementSelection`: `frame_statistics`
+settings, `blur`, and `camera_shake` settings. No intermediate video is written.
+
+Each branch applies exactly the filters of its file-level measurement, so results
+equal measuring an uncompressed copy of the same window with
+`measure_video_frame_statistics`, `measure_video_blur`, and `stream_camera_motion`.
+They differ from measuring `prepare_video_window` output, whose lossy H.264 encode
+changes pixel values. Unselected results are `None`. The window is clamped to the
+source end. A start at or beyond the source end, a damaged source, or a window that
+decodes to less than half its duration (at most 0.5 seconds) returns
+`UnreadableVideo`; unsupported sources return `UnsupportedVideo`, as
+`prepare_video_window` does. Timeouts and other process failures raise.

@@ -41,7 +41,9 @@ place:
 
 By default, `package build` selects every `.py` below `--package-root` except
 `__init__.py` and `__main__.py`. Use repeatable `--module` arguments for a
-smaller explicit set.
+smaller explicit set. `--jobs` runs Cython generation and native compilation
+in parallel; it defaults to one to preserve predictable resource use. A value
+near the available CPU count can shorten a large overlay build if memory permits.
 
 `py.typed` remains because the overlay changes a disposable runtime tree
 rather than repackaging the wheel. It does not imply that a type checker can
@@ -67,6 +69,7 @@ RUN uv venv /opt/native-builder && \
 
 RUN /opt/native-builder/bin/hflow package build \
       --package-root /usr/local/lib/python3.12/site-packages/hflow \
+      --jobs 16 \
       --output-dir /opt/hflow-overlay && \
     /opt/native-builder/bin/hflow package apply /opt/hflow-overlay \
       --target-package-root /usr/local/lib/python3.12/site-packages/hflow && \

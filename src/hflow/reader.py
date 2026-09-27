@@ -27,7 +27,7 @@ from typing import IO, Protocol
 
 import numpy as np
 from mcap.reader import McapReader, make_reader
-from mcap.records import Attachment
+from mcap.records import Attachment, Metadata
 from mcap.stream_reader import CRCValidationError
 from zstandard import ZstdError
 
@@ -115,6 +115,10 @@ class EpisodeReader(Protocol):
 
     def metadata(self) -> dict[str, dict[str, str]]:
         """All MCAP Metadata records, keyed by record name (last record wins)."""
+        ...
+
+    def iter_metadata(self) -> Iterator[Metadata]:
+        """All MCAP Metadata records as emitted by the file."""
         ...
 
     def time_bounds(self) -> EpisodeTimeBounds | None:
@@ -229,6 +233,9 @@ class PythonMcapEpisodeReader:
                 )
             records[record.name] = dict(record.metadata)
         return records
+
+    def iter_metadata(self) -> Iterator[Metadata]:
+        return self._reader.iter_metadata()
 
     def attachments(self) -> Iterator[Attachment]:
         return self._reader.iter_attachments()

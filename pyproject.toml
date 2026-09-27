@@ -1,6 +1,6 @@
 [project]
 name = "hflow"
-version = "0.2.13"
+version = "0.2.19"
 description = "Open source SDK for building Physical AI data pipelines"
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,8 +30,10 @@ dependencies = [
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
     "numpy>=2.4.6",
+    "platformdirs>=4.11.3",
     "pydantic>=2.13.4",
     "tenacity>=9.1.4",
+    "typer>=0.27.2",
     "zstandard>=0.25.0",
 ]
 
@@ -77,6 +79,7 @@ dev = [
     "opencv-python-headless>=5.0.0.93",
     "pyarrow>=25.0.1", # the arrow extra, present in dev so the suite tests it
     "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
     "pyyaml>=6.0.3",
     "ruff>=0.16.4",
     "setuptools>=84.0.0", # the native-build extra's extension builder

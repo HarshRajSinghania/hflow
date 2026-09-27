@@ -39,6 +39,8 @@ macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 
 Linux and macOS both work for native development. CI runs on Linux only, so
 run the quality checks yourself before opening a pull request on macOS.
+Native overlay builds require CPython on Linux, so the packaging tests that
+compile one are skipped on macOS.
 
 Native Windows is not supported: pipeline and storage operations use `fcntl`
 for file locking (`src/hflow/storage.py`), which does not exist on Windows. Work inside WSL2 with an Ubuntu
@@ -116,6 +118,9 @@ uv run --python 3.11 --locked pytest -q
 uv run --python 3.14 --locked pytest -q
 ```
 
+CI uses four pytest workers for the default suite. To match its test execution
+locally, run `uv run pytest -q -n 4`.
+
 Four integration test suites are intentionally opt-in because they need network
 access, Docker, a writable object-store prefix, or a model outside the default
 environment:
@@ -188,9 +193,8 @@ Give an example its own workspace project when it has a substantial dependency
 stack, multiple entry points, or colocated tests that need dependencies the
 root suite should not install. Its `pyproject.toml` should set
 `tool.uv.package = false`, depend on the workspace copy of `hflow`, and declare
-its own development tools. Register the directory in the root workspace and in
-CI's `workspace-example-checks` matrix. Keep small examples that only use HFlow
-or one optional client in the root project.
+its own development tools. Register the directory in the root workspace. Keep
+small examples that only use HFlow or one optional client in the root project.
 
 ## Changing how episodes are processed
 

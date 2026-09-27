@@ -183,3 +183,58 @@ def test_chunks_never_mix_groups(canonical_episode: Path) -> None:
             )
             chunk_group_kinds.add(DEFAULT_CAMERA_GROUP if in_cameras else "state")
     assert chunk_group_kinds == {DEFAULT_CAMERA_GROUP, "state"}
+
+
+def test_duplicate_metadata_refuses_with_source_not_conforming(tmp_path: Path) -> None:
+    from mcap.writer import Writer as StockWriter
+
+    from hflow.ingest_ledger import IngestFailureKind, classify_ingest_failure
+    from hflow.transform import SourceNotConforming
+
+    source = tmp_path / "dup_meta.mcap"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        channel_id = writer.register_channel(
+            topic="/state", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.add_metadata("episode/v1", {"task": "first", "success": "false"})
+        writer.add_metadata("episode/v1", {"task": "second", "success": "true"})
+        writer.finish()
+
+    output = tmp_path / "out.mcap"
+    with pytest.raises(
+        SourceNotConforming, match=r"duplicate metadata record 'episode/v1' in source"
+    ) as exc_info:
+        write_canonical_episode(source, output)
+
+    assert classify_ingest_failure(exc_info.value) is IngestFailureKind.SOURCE_UNSUPPORTED
+
+
+def test_episode_reader_iter_metadata_yields_all_records(tmp_path: Path) -> None:
+    from mcap.writer import Writer as StockWriter
+
+    from hflow.reader import open_reader
+
+    path = tmp_path / "multi_meta.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        channel_id = writer.register_channel(
+            topic="/state", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.add_metadata("episode/v1", {"task": "first"})
+        writer.add_metadata("episode/v1", {"task": "second"})
+        writer.add_metadata("custom/v1", {"foo": "bar"})
+        writer.finish()
+
+    reader = open_reader(path)
+    records = list(reader.iter_metadata())
+    assert len(records) == 3
+    assert [r.name for r in records] == ["episode/v1", "episode/v1", "custom/v1"]
+    # Keyed metadata() keeps the later one as documented
+    assert reader.metadata()["episode/v1"]["task"] == "second"

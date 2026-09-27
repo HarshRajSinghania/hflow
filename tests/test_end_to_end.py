@@ -3,6 +3,7 @@ infrastructure. Mirrors the README design-target example."""
 
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -13,6 +14,7 @@ import pytest
 import hflow
 from hflow.checks import camera_frame_stats
 from hflow.curation import open_catalog_connection
+from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -481,6 +483,61 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         )
 
 
+def test_canonical_episode_sparse_selection_past_argument_limit_uses_filter_file(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sparse selection of 20,000 isolated frames compiles to a 254 KB expression,
+
+    exceeding Linux's 128 KiB MAX_ARG_STRLEN. Episode.frames_at_indices must write
+    the expression to a filter script file rather than passing inline -vf on argv.
+    """
+    report, _app = report_and_app
+    sparse_indices = list(range(0, 40000, 2))
+    expression = hflow.episode._frame_selection_expression(sparse_indices)
+    assert len(expression) > 131072  # Exceeds Linux 128 KiB limit
+
+    with hflow.Episode(report.canonical_path) as episode:
+        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
+
+        class MockChannel:
+            timestamps = np.arange(40000, dtype=np.int64)
+
+            def __len__(self) -> int:
+                return len(self.timestamps)
+
+        monkeypatch.setattr(episode, "channel", lambda topic: MockChannel())
+
+        executed_command: list[str] = []
+
+        def mock_run(
+            command: list[str], *args: Any, **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            executed_command.extend(command)
+            # Verify no argument exceeds the 128 KiB system argument limit
+            assert all(len(arg) < 131072 for arg in command)
+            assert "-vf" not in command
+
+            flag = _ffmpeg_filter_script_flag()
+            assert flag in command
+            flag_index = command.index(flag)
+            script_path = Path(command[flag_index + 1])
+            assert script_path.is_file()
+            assert script_path.read_text(encoding="utf-8") == f"select={expression}"
+
+            staging_dir = script_path.parent
+            for idx in range(len(sparse_indices)):
+                (staging_dir / f"frame_{idx:06d}.jpg").write_bytes(b"\xff\xd8fake")
+
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", mock_run)
+
+        extracted_frames = episode.frames_at_indices(camera_topic, frame_indices=sparse_indices)
+        assert len(extracted_frames) == len(sparse_indices)
+        assert executed_command
+
+
 @pytest.mark.parametrize(
     ("invalid_frame_indices", "message"),
     [
@@ -490,9 +547,17 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         ([np.bool_(True)], r"^frame indices must be integers, not booleans$"),
         ([3.0], r"^frame indices must be integers$"),
         ([np.float64(3.0)], r"^frame indices must be integers$"),
+        ([0, 0], r"^frame indices must be unique and ascending$"),  # a duplicate index
+        ([5, 3], r"^frame indices must be unique and ascending$"),  # a descending pair
+        ([-1], r"^frame indices must be nonnegative$"),
+        # The nonnegative guard reads only the first index, so it is correct
+        # only after ascending order is established. [-1, -2] violates both
+        # guards and must be reported as not-ascending; if the two guards
+        # were swapped it would instead be reported as "nonnegative".
+        ([-1, -2], r"^frame indices must be unique and ascending$"),
     ],
 )
-def test_canonical_episode_rejects_non_integer_frame_indices(
+def test_canonical_episode_rejects_invalid_frame_indices(
     report_and_app: tuple[hflow.TestReport, hflow.App],
     invalid_frame_indices: list[Any],
     message: str,
@@ -505,48 +570,6 @@ def test_canonical_episode_rejects_non_integer_frame_indices(
                 camera_topic,
                 frame_indices=invalid_frame_indices,
             )
-
-
-@pytest.mark.parametrize(
-    "frame_indices",
-    [
-        [0, 0],  # a duplicate index
-        [5, 3],  # a descending pair
-    ],
-)
-def test_canonical_episode_rejects_non_ascending_frame_indices(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-    frame_indices: list[int],
-) -> None:
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be unique and ascending$"):
-            episode.frames_at_indices(camera_topic, frame_indices=frame_indices)
-
-
-def test_canonical_episode_rejects_negative_frame_indices(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-) -> None:
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be nonnegative$"):
-            episode.frames_at_indices(camera_topic, frame_indices=[-1])
-
-
-def test_frame_index_guards_run_ascending_before_nonnegative(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-) -> None:
-    """The nonnegative guard reads only the first index, so it is correct only
-    after ascending order is established. ``[-1, -2]`` violates both guards and
-    must be reported as not-ascending; if the two guards were swapped it would
-    instead be reported as "nonnegative"."""
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be unique and ascending$"):
-            episode.frames_at_indices(camera_topic, frame_indices=[-1, -2])
 
 
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:

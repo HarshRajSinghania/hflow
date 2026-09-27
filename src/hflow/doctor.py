@@ -3,10 +3,11 @@
 ``hflow doctor <file>`` / :func:`diagnose` check a file against the
 canonical-episode convention, in the spirit of ``mcap doctor``: container
 integrity (CRC-validated read, summary section, chunk indexes, statistics),
-the metadata records and their required stamps, chunk-group layout, per-topic
-time ordering, and every in-band video constraint (h264, one AUD-delimited
-access unit per message, SPS/PPS on keyframes, no B-frames, streams start on a
-keyframe, fixed GOP against the stamped interval).
+the metadata records and their required stamps, one channel per topic,
+chunk-group layout, per-topic time ordering, and every in-band video
+constraint (h264, one AUD-delimited access unit per message, SPS/PPS on
+keyframes, no B-frames, streams start on a keyframe, fixed GOP against the
+stamped interval).
 
 Findings, not exceptions: the doctor accumulates everything it can observe
 and reports levels. ``error`` breaks the convention; ``warning`` is legal but
@@ -244,13 +245,40 @@ def diagnose(path: Path | str) -> DoctorReport:
             for channel in summary.channels.values()
         }
         topics_by_channel_id = {channel.id: channel.topic for channel in summary.channels.values()}
+        channel_ids_by_topic: dict[str, list[int]] = {}
+        for channel in summary.channels.values():
+            channel_ids_by_topic.setdefault(channel.topic, []).append(channel.id)
+        for topic, channel_ids in sorted(channel_ids_by_topic.items()):
+            if len(channel_ids) < 2:
+                continue
+            ids = ", ".join(str(channel_id) for channel_id in sorted(channel_ids))
+            collector.add(
+                DiagnosticLevel.ERROR,
+                "multiple-channels-for-topic",
+                f"{topic}: {len(channel_ids)} channels (ids {ids}); "
+                "topic-keyed reads cannot represent them",
+            )
         video_channel_ids = {
             channel_id
             for channel_id, schema_name in schema_names_by_channel_id.items()
             if schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
 
-        metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
+        metadata_records: dict[str, dict[str, str]] = {}
+        metadata_name_counts: dict[str, int] = {}
+        for record in reader.iter_metadata():
+            metadata_name_counts[record.name] = metadata_name_counts.get(record.name, 0) + 1
+            metadata_records[record.name] = dict(record.metadata)
+
+        for record_name, count in sorted(metadata_name_counts.items()):
+            if count > 1:
+                collector.add(
+                    DiagnosticLevel.ERROR,
+                    "duplicate-metadata",
+                    f"duplicate metadata record {record_name!r} ({count} occurrences); "
+                    "convention requires unique metadata record names",
+                )
+
         provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
 
         def _positive_finite_seconds(raw_value: str) -> float | None:
@@ -329,9 +357,25 @@ def diagnose(path: Path | str) -> DoctorReport:
                 )
                 continue
 
+            missing_channel_ids = sorted(
+                channel_id for channel_id in chunk_channel_ids if channel_id not in summary.channels
+            )
+            if missing_channel_ids:
+                for channel_id in missing_channel_ids:
+                    collector.add(
+                        DiagnosticLevel.ERROR,
+                        "chunk-channel-missing",
+                        f"chunk {chunk_number} references channel id {channel_id} which has no "
+                        "Channel record in the summary section",
+                    )
+
+            valid_chunk_channel_ids = {
+                channel_id for channel_id in chunk_channel_ids if channel_id in summary.channels
+            }
+
             if group_by_topic:
                 chunk_groups = set()
-                for channel_id in chunk_channel_ids:
+                for channel_id in valid_chunk_channel_ids:
                     topic = topics_by_channel_id[channel_id]
                     if topic in group_by_topic:
                         chunk_groups.add(group_by_topic[topic])
@@ -346,7 +390,7 @@ def diagnose(path: Path | str) -> DoctorReport:
 
                 if len(chunk_groups) > 1:
                     mixed_topics = sorted(
-                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                        topics_by_channel_id[channel_id] for channel_id in valid_chunk_channel_ids
                     )
                     collector.add(
                         DiagnosticLevel.WARNING,
@@ -355,13 +399,15 @@ def diagnose(path: Path | str) -> DoctorReport:
                         "the default convention separates them",
                     )
             else:
-                has_video = any(channel_id in video_channel_ids for channel_id in chunk_channel_ids)
+                has_video = any(
+                    channel_id in video_channel_ids for channel_id in valid_chunk_channel_ids
+                )
                 has_state = any(
-                    channel_id not in video_channel_ids for channel_id in chunk_channel_ids
+                    channel_id not in video_channel_ids for channel_id in valid_chunk_channel_ids
                 )
                 if has_video and has_state:
                     mixed_topics = sorted(
-                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                        topics_by_channel_id[channel_id] for channel_id in valid_chunk_channel_ids
                     )
                     collector.add(
                         # A custom topic-group assignment could legally do this;

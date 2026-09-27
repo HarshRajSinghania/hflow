@@ -188,6 +188,7 @@ class CythonOverlayBuildConfig:
     package_root: Path
     package_name: str | None = None
     module_names: tuple[str, ...] | None = None
+    jobs: int = 1
 
 
 class CythonOverlayManifestError(ValueError):
@@ -298,6 +299,8 @@ def build_cython_overlay(
 ) -> CythonOverlayManifest:
     """Compile a fresh, verified overlay without modifying its source package."""
 
+    if config.jobs < 1:
+        raise CythonOverlayBuildError("jobs must be positive")
     package_root, package_name, module_sources = _resolve_build_inputs(config)
     build_target = current_native_build_target()
     if build_target.python_implementation != "cpython" or build_target.operating_system != "linux":
@@ -338,6 +341,7 @@ def build_cython_overlay(
             compiled_artifact_directory=compiled_artifact_directory,
             compiler_work_directory=temporary_build_root / "compiler",
             build_target=build_target,
+            jobs=config.jobs,
         )
         _assert_sources_unchanged(module_sources, source_hashes_before_build)
 
@@ -736,6 +740,7 @@ def _compile_cython_modules(
     compiled_artifact_directory: Path,
     compiler_work_directory: Path,
     build_target: NativeBuildTarget,
+    jobs: int,
 ) -> dict[str, Path]:
     try:
         from Cython.Build import cythonize
@@ -772,6 +777,7 @@ def _compile_cython_modules(
                 "language_level": 3,
             },
             force=True,
+            nthreads=jobs,
             quiet=True,
         )
         distribution = Distribution(
@@ -782,6 +788,7 @@ def _compile_cython_modules(
         build_command.build_temp = str(compiler_work_directory / "objects")
         build_command.force = True
         build_command.ensure_finalized()
+        build_command.parallel = jobs
         build_command.run()
 
     strip_executable = shutil.which("strip")
