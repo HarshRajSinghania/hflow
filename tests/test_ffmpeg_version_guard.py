@@ -1,5 +1,9 @@
 """Regression tests for the suite-level ffmpeg version gate."""
 
+from pathlib import Path
+
+import pytest
+
 from tests.conftest import _MIN_FFMPEG_VERSION, _ffmpeg_version_tuple, _suite_ffmpeg
 
 
@@ -15,7 +19,7 @@ def test_old_distro_ffmpeg_is_below_fps_mode_floor() -> None:
     assert parsed < _MIN_FFMPEG_VERSION
 
 
-def test_suite_ffmpeg_prefers_existing_hflow_ffmpeg_override(monkeypatch, tmp_path) -> None:
+def test_suite_ffmpeg_prefers_existing_hflow_ffmpeg_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     override = tmp_path / "managed-ffmpeg"
     override.write_text("#!/bin/sh\n")
     monkeypatch.setenv("HFLOW_FFMPEG", str(override))

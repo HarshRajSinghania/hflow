@@ -13,7 +13,6 @@ from numpy.typing import NDArray
 from hflow.blur import measure_video_blur, summarize_blur_scores
 
 
-
 def test_summary_preserves_raw_scores_and_excludes_unavailable_frames() -> None:
     summary = summarize_blur_scores(iter((120.0, math.nan, 240.0, math.inf, -math.inf)))
 
